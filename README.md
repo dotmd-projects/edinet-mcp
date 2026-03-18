@@ -1,4 +1,4 @@
-# EDINET財務諸表分析 MCP Server
+# edinet-mcp
 
 EDINET APIを利用して日本企業の財務諸表データを取得・分析するMCPサーバー。
 Claude DesktopからEDINETの決算データに直接アクセスできます。
@@ -38,9 +38,9 @@ pip install -r requirements.txt
 ```json
 {
   "mcpServers": {
-    "edinet-analyzer": {
-      "command": "/path/to/mcp_edinet_analyzer/.venv/bin/python",
-      "args": ["/path/to/mcp_edinet_analyzer/server.py"],
+    "edinet-mcp": {
+      "command": "/path/to/edinet-mcp/.venv/bin/python",
+      "args": ["/path/to/edinet-mcp/server.py"],
       "env": {
         "EDINET_SUBSCRIPTION_KEY": "your_subscription_key_here"
       }
@@ -51,6 +51,32 @@ pip install -r requirements.txt
 
 `command` と `args` のパスは実際のインストール先に合わせてください。
 設定後、Claude Desktopを再起動すると利用可能になります。
+
+### 4. リモートMCP（SSE）として利用する場合
+
+ローカル環境だけでなく、SSEトランスポートでリモートMCPサーバーとして起動できます。
+
+```bash
+python server.py --transport sse --port 8000
+```
+
+クライアント側の設定:
+
+```json
+{
+  "mcpServers": {
+    "edinet-mcp": {
+      "url": "https://your-server-url/sse"
+    }
+  }
+}
+```
+
+Claude Code の場合:
+
+```bash
+claude mcp add edinet-mcp --transport sse https://your-server-url/sse
+```
 
 ## 提供ツール
 
@@ -77,7 +103,7 @@ pip install -r requirements.txt
 ## プロジェクト構成
 
 ```
-mcp_edinet_analyzer/
+edinet-mcp/
 ├── server.py               # MCPサーバー本体
 ├── edinet_analyzer/         # コアロジック
 │   ├── analyzer.py          # EDINET API連携・XBRL解析

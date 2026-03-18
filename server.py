@@ -23,7 +23,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-mcp = FastMCP("edinet-analyzer", instructions="EDINET APIを利用して日本企業の財務諸表データを取得・分析するツールです。")
+mcp = FastMCP("edinet-mcp", instructions="EDINET APIを利用して日本企業の財務諸表データを取得・分析するツールです。")
 
 # Analyzerのインスタンスを遅延初期化
 _analyzer: EdinetFinancialAnalyzer | None = None
@@ -204,4 +204,20 @@ def compare_companies(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="EDINET財務諸表分析 MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "sse"],
+        default="stdio",
+        help="トランスポート方式 (default: stdio)",
+    )
+    parser.add_argument("--host", default="0.0.0.0", help="SSEホスト (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="SSEポート (default: 8000)")
+    args = parser.parse_args()
+
+    if args.transport == "sse":
+        mcp.run(transport="sse", host=args.host, port=args.port)
+    else:
+        mcp.run()
