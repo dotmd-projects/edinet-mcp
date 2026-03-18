@@ -1,0 +1,23 @@
+# 設定・認証情報
+config/config.json
+.env
+
+# データ・キャッシュ
+data/*
+!data/.gitkeep
+
+# ログ
+logs/*
+!logs/.gitkeep
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store
+
+# 出力ファイル
+output/
