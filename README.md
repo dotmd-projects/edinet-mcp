@@ -1,11 +1,13 @@
 # edinet-mcp
 
 EDINET APIを利用して日本企業の財務諸表データを取得・分析するMCPサーバー。
-Claude DesktopからEDINETの決算データに直接アクセスできます。
+Claude DesktopやClaude CodeからEDINETの決算データに直接アクセスできます。
 
 ## セットアップ
 
 ### 1. 依存パッケージのインストール
+
+Python 3.10以上が必要です。
 
 ```bash
 python -m venv .venv
@@ -31,7 +33,16 @@ pip install -r requirements.txt
 
 詳細な仕様は [EDINET API仕様書 (Version 2)](https://disclosure2dl.edinet-fsa.go.jp/guide/static/disclosure/WZEK0110.html) を参照してください。
 
-### 3. Claude Desktopへの登録
+### 3. 環境変数の設定
+
+`.env.example` を `.env` にコピーし、APIキーを設定します:
+
+```bash
+cp .env.example .env
+# .env を編集して EDINET_SUBSCRIPTION_KEY を設定
+```
+
+### 4. Claude Desktopへの登録
 
 `~/Library/Application Support/Claude/claude_desktop_config.json` に以下を追加します:
 
@@ -52,9 +63,9 @@ pip install -r requirements.txt
 `command` と `args` のパスは実際のインストール先に合わせてください。
 設定後、Claude Desktopを再起動すると利用可能になります。
 
-### 4. リモートMCP（SSE）として利用する場合
+### 5. リモートMCP（SSE）として利用する場合
 
-ローカル環境だけでなく、SSEトランスポートでリモートMCPサーバーとして起動できます。
+SSEトランスポートでリモートMCPサーバーとして起動できます。
 
 ```bash
 python server.py --transport sse --port 8000
@@ -87,12 +98,18 @@ claude mcp add edinet-mcp --transport sse https://your-server-url/sse
 | `get_financial_data` | 企業の財務データ (PL/BS/CF) を取得・億円単位で表示 |
 | `compare_companies` | 複数企業の財務データを比較 |
 
-### 使用例（Claude Desktopでの質問）
+### 使用例（Claude Desktop / Claude Codeでの質問）
 
 - 「トヨタ自動車のEDINETコードを調べて」
 - 「トヨタ自動車の2025年6月の決算書類を一覧して」
 - 「トヨタ自動車の2025年6月の財務データを取得して」
 - 「トヨタと本田の財務データを比較して」
+
+### パフォーマンスに関する注意
+
+EDINET APIは1日単位でしか書類一覧を取得できないため、**日付範囲は1〜2ヶ月以内を推奨**します。3月決算企業の有価証券報告書は通常6月に提出されるため、例えば `2025-06-01` 〜 `2025-06-30` のように絞ると高速に取得できます。
+
+一度取得した日付の書類一覧はディスクにキャッシュされるため、**同じ期間の2回目以降のクエリは即座に返ります**。
 
 ### 取得可能な財務項目
 
@@ -111,7 +128,8 @@ edinet-mcp/
 ├── config/
 │   └── config.json          # 運用設定 (rate_limit, timeout等)
 ├── data/
-│   └── master/              # EDINETコードマスタ (EdinetcodeDlInfo.csv)
+│   ├── master/              # EDINETコードマスタ (EdinetcodeDlInfo.csv)
+│   └── cache/               # XBRLファイル・書類一覧のキャッシュ
 ├── logs/                    # ログファイル
 ├── .env.example             # .envのテンプレート
 └── requirements.txt         # 依存パッケージ
@@ -123,9 +141,16 @@ edinet-mcp/
 
 ```json
 {
-    "rate_limit": 1,
+    "rate_limit": 0.3,
     "max_retries": 3,
     "timeout": 30,
     "cache_enabled": true
 }
 ```
+
+| パラメータ | 説明 | デフォルト |
+|-----------|------|-----------|
+| `rate_limit` | APIリクエスト間の最小間隔（秒） | 0.3 |
+| `max_retries` | APIエラー時のリトライ回数 | 3 |
+| `timeout` | APIリクエストのタイムアウト（秒） | 30 |
+| `cache_enabled` | XBRLファイルのディスクキャッシュ | true |
