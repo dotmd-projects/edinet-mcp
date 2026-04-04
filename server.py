@@ -58,6 +58,9 @@ def list_financial_reports(
 ) -> str:
     """指定期間内の企業の決算書類一覧を取得します。
 
+    日付範囲が広いほど時間がかかるため、1〜2ヶ月以内の範囲を推奨します。
+    3月決算企業の有価証券報告書は6月頃に提出されます。
+
     Args:
         company_name: 企業名（例: トヨタ自動車）
         start_date: 検索開始日（YYYY-MM-DD形式、例: 2025-06-01）
@@ -102,6 +105,8 @@ def get_financial_data(
 
     指定期間内の有価証券報告書・四半期報告書から財務諸表データを抽出し、
     期間ごとに整理して返します。
+    日付範囲は1〜2ヶ月以内を推奨します（広いと時間がかかります）。
+    3月決算企業の有価証券報告書は通常6月に提出されます。
 
     Args:
         company_name: 企業名（例: トヨタ自動車）
@@ -154,6 +159,9 @@ def compare_companies(
     end_date: str,
 ) -> str:
     """複数企業の財務データを比較します。
+
+    日付範囲は1〜2ヶ月以内を推奨します（広いと時間がかかります）。
+    3月決算企業の有価証券報告書は通常6月に提出されます。
 
     Args:
         company_names: 企業名のリスト（例: ["トヨタ自動車", "本田技研工業"]）
@@ -218,6 +226,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.transport == "sse":
-        mcp.run(transport="sse", host=args.host, port=args.port)
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport="sse")
     else:
         mcp.run()

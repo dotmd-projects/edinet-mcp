@@ -1,11 +1,12 @@
 """EDINET財務諸表分析のコアロジック"""
 
 import io
+import json
 import logging
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime
+from datetime import datetime, date as date_type
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -42,6 +43,8 @@ class EdinetFinancialAnalyzer:
         self.master_dir = self.data_dir / "master"
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.docs_cache_dir = self.data_dir / "cache" / "documents"
+        self.docs_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.rate_limit = self.config.get("rate_limit", 1)
         self.max_retries = self.config.get("max_retries", 3)
@@ -49,6 +52,11 @@ class EdinetFinancialAnalyzer:
 
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+
+        # 日付ごとの書類一覧キャッシュ（メモリ）
+        self._documents_cache: Dict[str, dict] = {}
+        # マスターCSVキャッシュ
+        self._master_df: Optional[pd.DataFrame] = None
 
         self._initialize_financial_items()
 
@@ -150,8 +158,11 @@ class EdinetFinancialAnalyzer:
     # EDINETコード検索
     # ------------------------------------------------------------------
 
-    def get_edinet_code(self, company_name: str) -> Optional[str]:
-        """企業名からEDINETコードを取得"""
+    def _load_master_df(self) -> Optional[pd.DataFrame]:
+        """マスターCSVを読み込みキャッシュする"""
+        if self._master_df is not None:
+            return self._master_df
+
         master_path = self.master_dir / "EdinetcodeDlInfo.csv"
         if not master_path.exists():
             logger.error("マスターファイルが見つかりません: %s", master_path)
@@ -170,8 +181,18 @@ class EdinetFinancialAnalyzer:
             logger.error("マスターファイルの読み込みに失敗しました")
             return None
 
-        normalized = self._normalize_company_name(company_name)
         df["_norm"] = df["提出者名"].apply(self._normalize_company_name)
+        self._master_df = df
+        logger.info("マスターCSV読み込み完了: %d件", len(df))
+        return df
+
+    def get_edinet_code(self, company_name: str) -> Optional[str]:
+        """企業名からEDINETコードを取得"""
+        df = self._load_master_df()
+        if df is None:
+            return None
+
+        normalized = self._normalize_company_name(company_name)
 
         # 完全一致
         exact = df[df["_norm"] == normalized]
@@ -212,8 +233,45 @@ class EdinetFinancialAnalyzer:
     # EDINET API
     # ------------------------------------------------------------------
 
+    def _is_past_date(self, date_str: str) -> bool:
+        """過去の日付かどうかを判定"""
+        try:
+            return datetime.strptime(date_str, "%Y-%m-%d").date() < date_type.today()
+        except ValueError:
+            return False
+
+    def _load_docs_disk_cache(self, date_str: str) -> Optional[dict]:
+        """ディスクキャッシュから書類一覧を読み込む"""
+        cache_path = self.docs_cache_dir / f"{date_str}.json"
+        if cache_path.exists():
+            try:
+                return json.loads(cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        return None
+
+    def _save_docs_disk_cache(self, date_str: str, data: dict) -> None:
+        """過去日付の書類一覧をディスクキャッシュに保存"""
+        if not self._is_past_date(date_str):
+            return
+        cache_path = self.docs_cache_dir / f"{date_str}.json"
+        try:
+            cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.debug("ディスクキャッシュ書き込み失敗 (%s): %s", date_str, e)
+
     def get_documents_list(self, date: str) -> dict:
-        """指定日の書類一覧を取得"""
+        """指定日の書類一覧を取得（メモリ+ディスクキャッシュ付き）"""
+        # メモリキャッシュ
+        if date in self._documents_cache:
+            return self._documents_cache[date]
+
+        # ディスクキャッシュ（過去日付のみ）
+        disk_cached = self._load_docs_disk_cache(date)
+        if disk_cached is not None:
+            self._documents_cache[date] = disk_cached
+            return disk_cached
+
         url = f"{self.base_url}/documents.json"
         params = {"date": date, "type": 2}
 
@@ -221,18 +279,28 @@ class EdinetFinancialAnalyzer:
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
                 if resp.status_code == 200:
-                    return resp.json()
+                    result = resp.json()
+                    self._documents_cache[date] = result
+                    self._save_docs_disk_cache(date, result)
+                    return result
                 if resp.status_code == 404:
-                    return {"results": []}
+                    empty = {"results": []}
+                    self._documents_cache[date] = empty
+                    self._save_docs_disk_cache(date, empty)
+                    return empty
                 if resp.status_code == 429:
                     time.sleep(self.rate_limit * 2)
                     continue
                 logger.warning("API %d: %s", resp.status_code, date)
-                return {"results": []}
+                empty = {"results": []}
+                self._documents_cache[date] = empty
+                return empty
             except Exception as e:
                 if attempt == self.max_retries - 1:
                     logger.error("API呼び出し失敗 (%d回リトライ): %s", self.max_retries, e)
-                    return {"results": []}
+                    empty = {"results": []}
+                    self._documents_cache[date] = empty
+                    return empty
                 time.sleep(self.rate_limit)
 
         return {"results": []}
@@ -490,23 +558,32 @@ class EdinetFinancialAnalyzer:
         logger.info("期間: %s ~ %s", start_date, end_date)
         logger.info("対象企業: %s", ", ".join(company_names))
 
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        date_range = pd.date_range(start_dt, end_dt, freq="B")
-
-        for i, company_name in enumerate(company_names, 1):
-            logger.info("[%d/%d] %s の処理を開始", i, len(company_names), company_name)
-
+        # EDINETコードを事前に解決
+        code_to_name: Dict[str, str] = {}
+        for company_name in company_names:
             edinet_code = self.get_edinet_code(company_name)
             if not edinet_code:
                 logger.error("%s のEDINETコードが取得できません。スキップします。", company_name)
                 continue
+            code_to_name[edinet_code] = company_name
 
-            # 書類検索
-            all_documents = self._search_documents(date_range, edinet_code)
-            logger.info("検出された書類数: %d", len(all_documents))
+        if not code_to_name:
+            return pd.DataFrame()
 
-            # 書類の処理
+        # 日付範囲を1回だけクエリし、全企業分の書類をまとめて収集
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        date_range = pd.date_range(start_dt, end_dt, freq="B")
+
+        target_codes = set(code_to_name.keys())
+        documents_by_code: Dict[str, list] = {code: [] for code in target_codes}
+        documents_by_code = self._search_documents_multi(date_range, target_codes)
+
+        # 企業ごとに書類を処理
+        for edinet_code, company_name in code_to_name.items():
+            all_documents = documents_by_code.get(edinet_code, [])
+            logger.info("%s: 検出された書類数: %d", company_name, len(all_documents))
+
             for doc_idx, doc in enumerate(all_documents, 1):
                 doc_type = doc.get("docTypeCode")
                 doc_type_name = TARGET_DOC_TYPES.get(doc_type, doc_type)
@@ -545,34 +622,41 @@ class EdinetFinancialAnalyzer:
 
         return self._create_result_dataframe(company_data)
 
-    def _search_documents(self, date_range, edinet_code: str) -> list:
-        """日付範囲内の対象書類を検索"""
-        all_documents = []
+    def _search_documents_multi(self, date_range, edinet_codes: set) -> Dict[str, list]:
+        """日付範囲内の対象書類を複数企業分まとめて検索（APIコール1回/日）"""
+        results: Dict[str, list] = {code: [] for code in edinet_codes}
         total_days = len(date_range)
+        last_request_time = 0.0
 
         for idx, date in enumerate(date_range):
             date_str = date.strftime("%Y-%m-%d")
             if (idx + 1) % 50 == 0 or idx == 0:
                 logger.info("  書類検索中... %d/%d 日", idx + 1, total_days)
 
+            # キャッシュヒット時はsleep不要
+            if date_str not in self._documents_cache:
+                elapsed = time.time() - last_request_time
+                if elapsed < self.rate_limit:
+                    time.sleep(self.rate_limit - elapsed)
+
             try:
+                last_request_time = time.time()
                 docs = self.get_documents_list(date_str)
                 if docs and docs.get("results"):
-                    relevant = [
-                        doc
-                        for doc in docs["results"]
-                        if doc.get("edinetCode") == edinet_code
-                        and doc.get("docTypeCode") in TARGET_DOC_TYPES
-                    ]
-                    if relevant:
-                        all_documents.extend(relevant)
-                        logger.info("  %s: %d件の書類を検出", date_str, len(relevant))
+                    for doc in docs["results"]:
+                        code = doc.get("edinetCode")
+                        if code in edinet_codes and doc.get("docTypeCode") in TARGET_DOC_TYPES:
+                            results[code].append(doc)
+                            logger.info("  %s: 書類検出 (%s)", date_str, code)
             except Exception as e:
                 logger.debug("書類検索エラー (%s): %s", date_str, e)
 
-            time.sleep(self.rate_limit)
+        return results
 
-        return all_documents
+    def _search_documents(self, date_range, edinet_code: str) -> list:
+        """日付範囲内の対象書類を検索（単一企業用）"""
+        results = self._search_documents_multi(date_range, {edinet_code})
+        return results.get(edinet_code, [])
 
     def _create_result_dataframe(self, company_data: Dict) -> pd.DataFrame:
         """財務データをDataFrameに変換
