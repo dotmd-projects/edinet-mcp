@@ -740,11 +740,11 @@ class EdinetFinancialAnalyzer:
         df = pd.DataFrame(all_rows)
 
         # 日付列を変換
-        df["提出日"] = pd.to_datetime(df["提出日"])
-        df["期間終了"] = pd.to_datetime(df["期間終了"])
-        df.loc[df["期間開始"] != "", "期間開始"] = pd.to_datetime(
-            df.loc[df["期間開始"] != "", "期間開始"]
-        )
+        df["提出日"] = pd.to_datetime(df["提出日"], errors="coerce")
+        df["期間終了"] = pd.to_datetime(df["期間終了"], errors="coerce")
+        # 空文字をNaNに変換してからdatetime化
+        df["期間開始"] = df["期間開始"].replace("", pd.NA)
+        df["期間開始"] = pd.to_datetime(df["期間開始"], errors="coerce")
 
         # 期間終了でソート
         df = df.sort_values(["企業名", "期間終了"])
@@ -772,7 +772,7 @@ class EdinetFinancialAnalyzer:
             for _, row in cdf.iterrows():
                 start = row["期間開始"]
                 end = row["期間終了"]
-                if pd.notna(start) and start != "":
+                if pd.notna(start):
                     label = f"{pd.Timestamp(start).strftime('%Y-%m-%d')}～{pd.Timestamp(end).strftime('%Y-%m-%d')}"
                 else:
                     label = pd.Timestamp(end).strftime("%Y-%m-%d")
