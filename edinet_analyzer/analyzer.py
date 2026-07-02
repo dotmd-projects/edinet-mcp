@@ -1,15 +1,17 @@
 """EDINET財務諸表分析のコアロジック"""
 
+from __future__ import annotations
+
 import io
 import json
 import logging
+import re
 import time
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime, date as date_type
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -19,12 +21,15 @@ from .config import ROOT_DIR, load_config
 logger = logging.getLogger(__name__)
 
 # 対象とする書類種別
+# 注: 四半期報告書は2024年の制度改正で廃止され、半期報告書(160)に移行した。
+#     過去データ取得のため四半期報告書のコードも残している。
 TARGET_DOC_TYPES = {
     "120": "有価証券報告書",
     "140": "四半期報告書",
     "143": "四半期報告書",
     "144": "四半期報告書",
     "145": "四半期報告書",
+    "160": "半期報告書",
 }
 
 
@@ -42,9 +47,8 @@ class EdinetFinancialAnalyzer:
         self.data_dir = ROOT_DIR / "data"
         self.master_dir = self.data_dir / "master"
         self.cache_dir = self.data_dir / "cache"
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.docs_cache_dir = self.data_dir / "cache" / "documents"
-        self.docs_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.doc_cache_dir = self.cache_dir / "documents"
+        self.doc_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.rate_limit = self.config.get("rate_limit", 1)
         self.max_retries = self.config.get("max_retries", 3)
@@ -53,10 +57,10 @@ class EdinetFinancialAnalyzer:
         self.session = requests.Session()
         self.session.headers.update(self.headers)
 
-        # 日付ごとの書類一覧キャッシュ（メモリ）
-        self._documents_cache: Dict[str, dict] = {}
-        # マスターCSVキャッシュ
-        self._master_df: Optional[pd.DataFrame] = None
+        self._master_df: pd.DataFrame | None = None
+        self._last_request_ts = 0.0
+        # 日付ごとの書類一覧キャッシュ（メモリ。過去日のみ保持）
+        self._documents_cache: dict[str, dict] = {}
 
         self._initialize_financial_items()
 
@@ -148,18 +152,12 @@ class EdinetFinancialAnalyzer:
             },
         }
 
-        self.financial_items_reverse = {}
-        for statement_type, items in self.financial_items.items():
-            self.financial_items_reverse[statement_type] = {
-                v: k for k, v in items.items()
-            }
-
     # ------------------------------------------------------------------
     # EDINETコード検索
     # ------------------------------------------------------------------
 
-    def _load_master_df(self) -> Optional[pd.DataFrame]:
-        """マスターCSVを読み込みキャッシュする"""
+    def _load_master(self) -> pd.DataFrame | None:
+        """EDINETコードマスタを読み込む（初回のみ。以降はメモリキャッシュ）"""
         if self._master_df is not None:
             return self._master_df
 
@@ -168,28 +166,23 @@ class EdinetFinancialAnalyzer:
             logger.error("マスターファイルが見つかりません: %s", master_path)
             return None
 
-        df = None
         for encoding in ("cp932", "shift_jis", "utf-8"):
             try:
                 df = pd.read_csv(master_path, encoding=encoding, skiprows=1)
-                if "ＥＤＩＮＥＴコード" in df.columns and "提出者名" in df.columns:
-                    break
-            except Exception:
+            except (UnicodeDecodeError, pd.errors.ParserError, ValueError):
                 continue
+            if "ＥＤＩＮＥＴコード" in df.columns and "提出者名" in df.columns:
+                df["_norm"] = df["提出者名"].apply(self._normalize_company_name)
+                self._master_df = df
+                return df
 
-        if df is None or df.empty:
-            logger.error("マスターファイルの読み込みに失敗しました")
-            return None
+        logger.error("マスターファイルの読み込みに失敗しました")
+        return None
 
-        df["_norm"] = df["提出者名"].apply(self._normalize_company_name)
-        self._master_df = df
-        logger.info("マスターCSV読み込み完了: %d件", len(df))
-        return df
-
-    def get_edinet_code(self, company_name: str) -> Optional[str]:
+    def get_edinet_code(self, company_name: str) -> str | None:
         """企業名からEDINETコードを取得"""
-        df = self._load_master_df()
-        if df is None:
+        df = self._load_master()
+        if df is None or df.empty:
             return None
 
         normalized = self._normalize_company_name(company_name)
@@ -202,7 +195,7 @@ class EdinetFinancialAnalyzer:
             return match["ＥＤＩＮＥＴコード"]
 
         # 部分一致 + 類似度
-        partial = df[df["_norm"].str.contains(normalized, na=False)]
+        partial = df[df["_norm"].str.contains(normalized, na=False, regex=False)]
         if not partial.empty:
             best_idx = max(
                 range(len(partial)),
@@ -233,79 +226,95 @@ class EdinetFinancialAnalyzer:
     # EDINET API
     # ------------------------------------------------------------------
 
-    def _is_past_date(self, date_str: str) -> bool:
-        """過去の日付かどうかを判定"""
-        try:
-            return datetime.strptime(date_str, "%Y-%m-%d").date() < date_type.today()
-        except ValueError:
-            return False
+    def _throttle(self) -> None:
+        """前回のAPIリクエストからrate_limit秒空ける（キャッシュヒット時は呼ばれない）"""
+        elapsed = time.monotonic() - self._last_request_ts
+        if elapsed < self.rate_limit:
+            time.sleep(self.rate_limit - elapsed)
+        self._last_request_ts = time.monotonic()
 
-    def _load_docs_disk_cache(self, date_str: str) -> Optional[dict]:
-        """ディスクキャッシュから書類一覧を読み込む"""
-        cache_path = self.docs_cache_dir / f"{date_str}.json"
-        if cache_path.exists():
+    def _request(self, url: str, params: dict) -> requests.Response | None:
+        """リトライ・レート制限(429)処理付きのGETリクエスト
+
+        通信エラーはmax_retries回まで再試行。429はリトライ回数を消費せず、
+        指数バックオフで最大max_retries回まで待機する。
+        """
+        errors = 0
+        rate_limited = 0
+        while True:
+            self._throttle()
             try:
-                return json.loads(cache_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return None
+                resp = self.session.get(url, params=params, timeout=self.timeout)
+            except requests.RequestException as e:
+                errors += 1
+                if errors >= self.max_retries:
+                    logger.error("API呼び出し失敗 (%d回リトライ): %s", self.max_retries, e)
+                    return None
+                time.sleep(self.rate_limit)
+                continue
 
-    def _save_docs_disk_cache(self, date_str: str, data: dict) -> None:
-        """過去日付の書類一覧をディスクキャッシュに保存"""
-        if not self._is_past_date(date_str):
-            return
-        cache_path = self.docs_cache_dir / f"{date_str}.json"
-        try:
-            cache_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        except Exception as e:
-            logger.debug("ディスクキャッシュ書き込み失敗 (%s): %s", date_str, e)
+            if resp.status_code == 429:
+                rate_limited += 1
+                if rate_limited >= self.max_retries:
+                    logger.error("レート制限が解消されませんでした: %s", url)
+                    return None
+                logger.warning("レート制限。待機中...")
+                time.sleep(self.rate_limit * (2 ** rate_limited))
+                continue
+
+            return resp
 
     def get_documents_list(self, date: str) -> dict:
-        """指定日の書類一覧を取得（メモリ+ディスクキャッシュ付き）"""
-        # メモリキャッシュ
-        if date in self._documents_cache:
-            return self._documents_cache[date]
+        """指定日の書類一覧を取得
 
-        # ディスクキャッシュ（過去日付のみ）
-        disk_cached = self._load_docs_disk_cache(date)
-        if disk_cached is not None:
-            self._documents_cache[date] = disk_cached
-            return disk_cached
+        過去日の一覧は変化しないため、cache_enabled時はメモリとディスクにキャッシュする
+        （当日分は提出が増えるためキャッシュしない）。
+        """
+        cache_path = self.doc_cache_dir / f"{date}.json"
+        is_past = date < datetime.now().strftime("%Y-%m-%d")
+        use_cache = self.config.get("cache_enabled") and is_past
+
+        if use_cache:
+            if date in self._documents_cache:
+                return self._documents_cache[date]
+            if cache_path.exists():
+                try:
+                    result = json.loads(cache_path.read_text(encoding="utf-8"))
+                    self._documents_cache[date] = result
+                    return result
+                except (OSError, json.JSONDecodeError) as e:
+                    logger.debug("書類一覧キャッシュの読み込みに失敗 (%s): %s", date, e)
 
         url = f"{self.base_url}/documents.json"
         params = {"date": date, "type": 2}
 
-        for attempt in range(self.max_retries):
+        resp = self._request(url, params)
+        if resp is None:
+            return {"results": []}
+        if resp.status_code == 404:
+            return {"results": []}
+        if resp.status_code != 200:
+            logger.warning("API %d: %s", resp.status_code, date)
+            return {"results": []}
+
+        try:
+            result = resp.json()
+        except ValueError as e:
+            logger.error("書類一覧のJSON解析に失敗 (%s): %s", date, e)
+            return {"results": []}
+
+        if use_cache:
+            self._documents_cache[date] = result
             try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-                if resp.status_code == 200:
-                    result = resp.json()
-                    self._documents_cache[date] = result
-                    self._save_docs_disk_cache(date, result)
-                    return result
-                if resp.status_code == 404:
-                    empty = {"results": []}
-                    self._documents_cache[date] = empty
-                    self._save_docs_disk_cache(date, empty)
-                    return empty
-                if resp.status_code == 429:
-                    time.sleep(self.rate_limit * 2)
-                    continue
-                logger.warning("API %d: %s", resp.status_code, date)
-                empty = {"results": []}
-                self._documents_cache[date] = empty
-                return empty
-            except Exception as e:
-                if attempt == self.max_retries - 1:
-                    logger.error("API呼び出し失敗 (%d回リトライ): %s", self.max_retries, e)
-                    empty = {"results": []}
-                    self._documents_cache[date] = empty
-                    return empty
-                time.sleep(self.rate_limit)
+                cache_path.write_text(
+                    json.dumps(result, ensure_ascii=False), encoding="utf-8"
+                )
+            except OSError as e:
+                logger.debug("書類一覧キャッシュの保存に失敗 (%s): %s", date, e)
 
-        return {"results": []}
+        return result
 
-    def download_xbrl(self, doc_id: str) -> Optional[bytes]:
+    def download_xbrl(self, doc_id: str) -> bytes | None:
         """書類IDからXBRLをダウンロード"""
         cache_path = self.cache_dir / f"{doc_id}.xbrl"
         if self.config.get("cache_enabled") and cache_path.exists():
@@ -313,42 +322,35 @@ class EdinetFinancialAnalyzer:
             return cache_path.read_bytes()
 
         url = f"{self.base_url}/documents/{doc_id}"
-        params = {"type": 1, "Subscription-Key": self.config["subscription_key"]}
+        # 認証はセッションヘッダーのOcp-Apim-Subscription-Keyで行う
+        # （クエリパラメータに載せるとURLログにAPIキーが露出するため）
+        params = {"type": 1}
 
-        for attempt in range(self.max_retries):
-            try:
-                resp = self.session.get(url, params=params, timeout=self.timeout)
-                if resp.status_code == 200:
-                    return self._extract_xbrl_from_zip(resp.content, doc_id, cache_path)
-                if resp.status_code == 429:
-                    logger.warning("レート制限。待機中...")
-                    time.sleep(self.rate_limit * 2)
-                    continue
-                logger.error("ダウンロード失敗 %s: HTTP %d", doc_id, resp.status_code)
-                return None
-            except requests.exceptions.RequestException as e:
-                if attempt == self.max_retries - 1:
-                    logger.error("ダウンロードエラー %s: %s", doc_id, e)
-                    return None
-                time.sleep(self.rate_limit)
+        resp = self._request(url, params)
+        if resp is None:
+            return None
+        if resp.status_code != 200:
+            logger.error("ダウンロード失敗 %s: HTTP %d", doc_id, resp.status_code)
+            return None
 
-        return None
+        return self._extract_xbrl_from_zip(resp.content, doc_id, cache_path)
 
     def _extract_xbrl_from_zip(
         self, zip_bytes: bytes, doc_id: str, cache_path: Path
-    ) -> Optional[bytes]:
+    ) -> bytes | None:
         """ZIPからXBRLインスタンス文書を抽出
 
         優先順位:
         1. PublicDoc内の .xbrl ファイル（通常XBRLインスタンス文書、財務データ本体）
         2. PublicDoc内の .htm ファイル（InlineXBRL、フォールバック）
+           - ファイル名に「0105」（経理の状況）を含むものを優先し、
+             なければ最大サイズのファイルを選ぶ（表紙等の空振りを避ける）
         """
         try:
             with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                 public_files = [
                     f for f in zf.filelist if "PublicDoc" in f.filename
                 ]
-                # .xbrl インスタンス文書を優先
                 xbrl_instance = [
                     f for f in public_files if f.filename.endswith(".xbrl")
                 ]
@@ -360,7 +362,11 @@ class EdinetFinancialAnalyzer:
                 if xbrl_instance:
                     target = xbrl_instance[0]
                 elif htm_files:
-                    target = htm_files[0]
+                    keiri = [f for f in htm_files if "0105" in Path(f.filename).name]
+                    if keiri:
+                        target = keiri[0]
+                    else:
+                        target = max(htm_files, key=lambda f: f.file_size)
 
                 if not target:
                     logger.warning("ZIP内にXBRLファイルなし: %s", doc_id)
@@ -370,7 +376,10 @@ class EdinetFinancialAnalyzer:
                 logger.debug("XBRL抽出: %s -> %s", doc_id, target.filename)
 
                 if self.config.get("cache_enabled"):
-                    cache_path.write_bytes(content)
+                    try:
+                        cache_path.write_bytes(content)
+                    except OSError as e:
+                        logger.debug("XBRLキャッシュの保存に失敗 (%s): %s", doc_id, e)
 
                 return content
         except zipfile.BadZipFile:
@@ -381,7 +390,7 @@ class EdinetFinancialAnalyzer:
     # XBRL解析
     # ------------------------------------------------------------------
 
-    def process_financial_data(self, xml_content: bytes) -> Optional[Dict]:
+    def process_financial_data(self, xml_content: bytes) -> dict | None:
         """XMLから財務データを抽出
 
         InlineXBRL (.htm) と通常XBRL (.xbrl) の両方に対応。
@@ -396,16 +405,25 @@ class EdinetFinancialAnalyzer:
         # BOM除去
         xml_str = xml_str.lstrip("\ufeff")
 
+        # 1パスでルート要素と名前空間を同時に取得する
+        root = None
+        namespaces: dict[str, str] = {}
         try:
-            root = ET.fromstring(xml_str)
+            for event, obj in ET.iterparse(
+                io.StringIO(xml_str), events=("start", "start-ns")
+            ):
+                if event == "start-ns":
+                    prefix, uri = obj
+                    namespaces.setdefault(prefix, uri)
+                elif root is None:
+                    root = obj
         except ET.ParseError as e:
             logger.error("XML解析エラー: %s", e)
             return None
 
-        # 名前空間の取得
-        namespaces = dict(
-            node for _, node in ET.iterparse(io.StringIO(xml_str), events=["start-ns"])
-        )
+        if root is None:
+            logger.error("XMLにルート要素がありません")
+            return None
 
         # ルート要素のタグで形式を判定
         is_inline = root.tag.endswith("}html") or root.tag == "html"
@@ -441,7 +459,7 @@ class EdinetFinancialAnalyzer:
         return None
 
     @staticmethod
-    def _decode_xml(content: bytes) -> Optional[str]:
+    def _decode_xml(content: bytes) -> str | None:
         for enc in ("utf-8", "shift_jis", "cp932"):
             try:
                 return content.decode(enc)
@@ -489,20 +507,7 @@ class EdinetFinancialAnalyzer:
                     break
 
         for elem in elements:
-            ctx_ref = elem.get("contextRef")
-            if not ctx_ref or ctx_ref not in contexts:
-                continue
-            try:
-                text = (elem.text or "").strip().replace(",", "")
-                value = float(text)
-                ctx = contexts[ctx_ref]
-                if ctx["type"] == "instant":
-                    key = f"{item_name}_{ctx['date']}"
-                else:
-                    key = f"{item_name}_{ctx['start']}_{ctx['end']}"
-                results[key] = value
-            except (ValueError, TypeError):
-                continue
+            _extract_xbrl_element(elem, item_name, item_name, contexts, results)
 
         return results
 
@@ -540,48 +545,41 @@ class EdinetFinancialAnalyzer:
 
         return results
 
-
     # ------------------------------------------------------------------
     # メイン分析
     # ------------------------------------------------------------------
 
     def analyze_companies(
         self,
-        company_names: List[str],
+        company_names: list[str],
         start_date: str,
         end_date: str,
     ) -> pd.DataFrame:
         """複数企業の財務データを分析"""
-        company_data: Dict[str, list] = {name: [] for name in company_names}
+        company_data: dict[str, list] = {name: [] for name in company_names}
 
         logger.info("=== 分析開始 ===")
         logger.info("期間: %s ~ %s", start_date, end_date)
         logger.info("対象企業: %s", ", ".join(company_names))
 
-        # EDINETコードを事前に解決
-        code_to_name: Dict[str, str] = {}
+        # 企業名 → EDINETコードを先に解決する
+        code_to_company: dict[str, str] = {}
         for company_name in company_names:
             edinet_code = self.get_edinet_code(company_name)
-            if not edinet_code:
+            if edinet_code:
+                code_to_company[edinet_code] = company_name
+            else:
                 logger.error("%s のEDINETコードが取得できません。スキップします。", company_name)
-                continue
-            code_to_name[edinet_code] = company_name
 
-        if not code_to_name:
-            return pd.DataFrame()
+        if not code_to_company:
+            return self._create_result_dataframe(company_data)
 
-        # 日付範囲を1回だけクエリし、全企業分の書類をまとめて収集
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
-        date_range = pd.date_range(start_dt, end_dt, freq="B")
+        # 日付範囲を1回だけ走査して全企業分の書類を収集する
+        date_range = self._business_days(start_date, end_date)
+        docs_by_code = self._search_documents_multi(date_range, set(code_to_company))
 
-        target_codes = set(code_to_name.keys())
-        documents_by_code: Dict[str, list] = {code: [] for code in target_codes}
-        documents_by_code = self._search_documents_multi(date_range, target_codes)
-
-        # 企業ごとに書類を処理
-        for edinet_code, company_name in code_to_name.items():
-            all_documents = documents_by_code.get(edinet_code, [])
+        for edinet_code, company_name in code_to_company.items():
+            all_documents = docs_by_code.get(edinet_code, [])
             logger.info("%s: 検出された書類数: %d", company_name, len(all_documents))
 
             for doc_idx, doc in enumerate(all_documents, 1):
@@ -607,7 +605,7 @@ class EdinetFinancialAnalyzer:
                     fin_data.update(
                         {
                             "企業名": company_name,
-                            "提出日": doc.get("submitDateTime", "").split()[0],
+                            "提出日": self._submit_date(doc),
                             "書類種別": doc_type_name,
                             "EDINETコード": edinet_code,
                             "書類ID": doc_id,
@@ -622,52 +620,72 @@ class EdinetFinancialAnalyzer:
 
         return self._create_result_dataframe(company_data)
 
-    def _search_documents_multi(self, date_range, edinet_codes: set) -> Dict[str, list]:
-        """日付範囲内の対象書類を複数企業分まとめて検索（APIコール1回/日）"""
-        results: Dict[str, list] = {code: [] for code in edinet_codes}
+    def list_documents(
+        self, company_name: str, start_date: str, end_date: str
+    ) -> list[dict] | None:
+        """企業名と期間から対象書類の一覧を取得する
+
+        EDINETコードが見つからない場合はNoneを、
+        書類が見つからない場合は空リストを返す。
+        """
+        edinet_code = self.get_edinet_code(company_name)
+        if not edinet_code:
+            return None
+        date_range = self._business_days(start_date, end_date)
+        return self._search_documents(date_range, edinet_code)
+
+    @staticmethod
+    def _business_days(start_date: str, end_date: str) -> pd.DatetimeIndex:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        return pd.date_range(start_dt, end_dt, freq="B")
+
+    @staticmethod
+    def _submit_date(doc: dict) -> str:
+        """書類のsubmitDateTimeから日付部分を安全に取り出す"""
+        parts = (doc.get("submitDateTime") or "").split()
+        return parts[0] if parts else ""
+
+    def _search_documents_multi(
+        self, date_range: pd.DatetimeIndex, edinet_codes: set[str]
+    ) -> dict[str, list]:
+        """日付範囲内の対象書類を複数企業分まとめて検索する"""
+        docs_by_code: dict[str, list] = {code: [] for code in edinet_codes}
         total_days = len(date_range)
-        last_request_time = 0.0
 
         for idx, date in enumerate(date_range):
             date_str = date.strftime("%Y-%m-%d")
             if (idx + 1) % 50 == 0 or idx == 0:
                 logger.info("  書類検索中... %d/%d 日", idx + 1, total_days)
 
-            # キャッシュヒット時はsleep不要
-            if date_str not in self._documents_cache:
-                elapsed = time.time() - last_request_time
-                if elapsed < self.rate_limit:
-                    time.sleep(self.rate_limit - elapsed)
+            docs = self.get_documents_list(date_str)
+            for doc in docs.get("results", []):
+                code = doc.get("edinetCode")
+                if code in edinet_codes and doc.get("docTypeCode") in TARGET_DOC_TYPES:
+                    docs_by_code[code].append(doc)
+                    logger.info(
+                        "  %s: 書類を検出 (%s, ID: %s)",
+                        date_str,
+                        code,
+                        doc.get("docID"),
+                    )
 
-            try:
-                last_request_time = time.time()
-                docs = self.get_documents_list(date_str)
-                if docs and docs.get("results"):
-                    for doc in docs["results"]:
-                        code = doc.get("edinetCode")
-                        if code in edinet_codes and doc.get("docTypeCode") in TARGET_DOC_TYPES:
-                            results[code].append(doc)
-                            logger.info("  %s: 書類検出 (%s)", date_str, code)
-            except Exception as e:
-                logger.debug("書類検索エラー (%s): %s", date_str, e)
+        return docs_by_code
 
-        return results
+    def _search_documents(
+        self, date_range: pd.DatetimeIndex, edinet_code: str
+    ) -> list:
+        """日付範囲内の対象書類を検索（単一企業）"""
+        return self._search_documents_multi(date_range, {edinet_code})[edinet_code]
 
-    def _search_documents(self, date_range, edinet_code: str) -> list:
-        """日付範囲内の対象書類を検索（単一企業用）"""
-        results = self._search_documents_multi(date_range, {edinet_code})
-        return results.get(edinet_code, [])
-
-    def _create_result_dataframe(self, company_data: Dict) -> pd.DataFrame:
+    def _create_result_dataframe(self, company_data: dict) -> pd.DataFrame:
         """財務データをDataFrameに変換
 
         期間ごとに1行に整形する。
         例: PL_NetSales_2023-04-01_2024-03-31 → 期間開始=2023-04-01, 売上高=value
         """
-        import re
-
         # 項目名 → 日本語名の逆引きテーブルを構築
-        item_to_japanese: Dict[str, str] = {}
+        item_to_japanese: dict[str, str] = {}
         for statement_type, items in self.financial_items.items():
             for eng_name, jpn_name in items.items():
                 item_to_japanese[f"{statement_type}_{eng_name}"] = jpn_name
@@ -688,7 +706,7 @@ class EdinetFinancialAnalyzer:
                 # duration (PL/CF): PL_NetSales_2023-04-01_2024-03-31 → 期間終了=2024-03-31
                 # instant (BS):     BS_Assets_2024-03-31              → 期間終了=2024-03-31
                 # 同じ期間終了日のdurationとinstantを1行にマージする
-                period_data: Dict[str, dict] = {}
+                period_data: dict[str, dict] = {}
 
                 for key, value in data.items():
                     if not key.startswith(("PL_", "BS_", "CF_")) or value is None:
@@ -739,12 +757,18 @@ class EdinetFinancialAnalyzer:
 
         df = pd.DataFrame(all_rows)
 
-        # 日付列を変換
+        # 日付列を変換（不正な値・空文字はNaT扱い。部分代入はpandas 3のstr dtypeでエラーになるため列全体を変換する）
         df["提出日"] = pd.to_datetime(df["提出日"], errors="coerce")
         df["期間終了"] = pd.to_datetime(df["期間終了"], errors="coerce")
-        # 空文字をNaNに変換してからdatetime化
-        df["期間開始"] = df["期間開始"].replace("", pd.NA)
-        df["期間開始"] = pd.to_datetime(df["期間開始"], errors="coerce")
+        df["期間開始"] = pd.to_datetime(df["期間開始"].replace("", None), errors="coerce")
+
+        # 期間終了が不正な行は後続の転置処理で扱えないため除外する
+        invalid = df["期間終了"].isna()
+        if invalid.any():
+            logger.warning("期間終了が不正な%d行を除外しました", int(invalid.sum()))
+            df = df[~invalid]
+        if df.empty:
+            return pd.DataFrame()
 
         # 期間終了でソート
         df = df.sort_values(["企業名", "期間終了"])
@@ -767,22 +791,18 @@ class EdinetFinancialAnalyzer:
         for company in df["企業名"].unique():
             cdf = df[df["企業名"] == company].sort_values("期間終了")
 
-            # 列ヘッダー用のラベルを作成（例: "2024-04-01～2025-03-31"）
-            period_labels = []
+            # 期間ラベル → 列データの辞書を構築（例: "2024-04-01～2025-03-31"）
+            col_data: dict[str, list] = {}
             for _, row in cdf.iterrows():
                 start = row["期間開始"]
                 end = row["期間終了"]
-                if pd.notna(start):
+                if pd.notna(start) and start != "":
                     label = f"{pd.Timestamp(start).strftime('%Y-%m-%d')}～{pd.Timestamp(end).strftime('%Y-%m-%d')}"
                 else:
                     label = pd.Timestamp(end).strftime("%Y-%m-%d")
-                period_labels.append(label)
+                col_data[label] = [row.get(item) for item in item_cols]
 
-            # 項目×期間の転置DataFrame
-            transposed = pd.DataFrame(index=item_cols, columns=period_labels)
-            for label, (_, row) in zip(period_labels, cdf.iterrows()):
-                for item in item_cols:
-                    transposed.loc[item, label] = row.get(item)
+            transposed = pd.DataFrame(col_data, index=item_cols)
 
             # NaNのみの行（全期間でデータなし）を除去
             transposed = transposed.dropna(how="all")

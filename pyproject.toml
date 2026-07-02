@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "edinet-analyzer"
+version = "0.2.0"
+description = "EDINET APIを利用した日本企業の財務諸表分析ツール (CLI / MCPサーバー)"
+readme = "README.md"
+license = { file = "LICENSE.md" }
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.31",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0",
+    "uvicorn>=0.30",
+    "starlette",
+    "sse-starlette",
+]
+test = [
+    "pytest",
+]
+
+[project.scripts]
+edinet-analyzer = "edinet_analyzer.__main__:main"
+
+[tool.setuptools]
+packages = ["edinet_analyzer"]
