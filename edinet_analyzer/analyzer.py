@@ -131,24 +131,27 @@ class EdinetFinancialAnalyzer:
                 "ValuationAndTranslationAdjustments": "評価・換算差額等",
                 "NonControllingInterests": "非支配株主持分",
             },
+            # CFのタグ名は日本基準タクソノミ(jppfs_cor)の実際の要素名に合わせる。
+            # 明細項目には活動区分のサフィックス(OpeCF/InvCF/FinCF)が付く。
             "CF": {
                 "NetCashProvidedByUsedInOperatingActivities": "営業CF",
                 "NetCashProvidedByUsedInInvestmentActivities": "投資CF",
                 "NetCashProvidedByUsedInFinancingActivities": "財務CF",
                 "CashAndCashEquivalents": "現金等期末残高",
                 "DepreciationAndAmortizationOpeCF": "減価償却費",
-                "InterestAndDividendsIncomeReceived": "受取利息及び受取配当金",
-                "InterestExpensesPaid": "支払利息",
-                "IncomeTaxesPaid": "法人税等の支払額",
-                "PaymentsForPropertyPlantAndEquipment": "有形固定資産の取得による支出",
-                "ProceedsFromSalesOfPropertyPlantAndEquipment": "有形固定資産の売却による収入",
-                "PaymentsForInvestmentSecurities": "投資有価証券の取得による支出",
-                "ProceedsFromSalesOfInvestmentSecurities": "投資有価証券の売却による収入",
-                "ProceedsFromLongTermLoans": "長期借入れによる収入",
-                "RepaymentsOfLongTermLoans": "長期借入金の返済による支出",
-                "ProceedsFromIssuanceOfBonds": "社債の発行による収入",
-                "RedemptionOfBonds": "社債の償還による支出",
-                "CashDividendsPaid": "配当金の支払額",
+                "InterestAndDividendsIncomeReceivedOpeCFInvCF": "受取利息及び受取配当金の受取額",
+                "InterestExpensesPaidOpeCFFinCF": "利息の支払額",
+                "IncomeTaxesPaidOpeCF": "法人税等の支払額",
+                "PurchaseOfPropertyPlantAndEquipmentInvCF": "有形固定資産の取得による支出",
+                "ProceedsFromSalesOfPropertyPlantAndEquipmentInvCF": "有形固定資産の売却による収入",
+                "PurchaseOfIntangibleAssetsInvCF": "無形固定資産の取得による支出",
+                "PurchaseOfInvestmentSecuritiesInvCF": "投資有価証券の取得による支出",
+                "ProceedsFromSalesOfInvestmentSecuritiesInvCF": "投資有価証券の売却による収入",
+                "ProceedsFromLongTermLoansPayableFinCF": "長期借入れによる収入",
+                "RepaymentOfLongTermLoansPayableFinCF": "長期借入金の返済による支出",
+                "ProceedsFromIssuanceOfBondsFinCF": "社債の発行による収入",
+                "RedemptionOfBondsFinCF": "社債の償還による支出",
+                "CashDividendsPaidFinCF": "配当金の支払額",
             },
         }
 
@@ -434,6 +437,8 @@ class EdinetFinancialAnalyzer:
         ns.setdefault("xbrli", "http://www.xbrl.org/2003/instance")
         ns.setdefault("jpcrp_cor", "http://disclosure.edinet-fsa.go.jp/taxonomy/jpcrp/2022-11-01/jpcrp_cor")
         ns.setdefault("jpigp_cor", "http://disclosure.edinet-fsa.go.jp/taxonomy/jpigp/2022-11-01/jpigp_cor")
+        # jppfs_cor は日本基準の財務諸表本表タクソノミ。CF明細(PL/BS本体)の要素が属する
+        ns.setdefault("jppfs_cor", "http://disclosure.edinet-fsa.go.jp/taxonomy/jppfs/2022-11-01/jppfs_cor")
 
         # context情報を収集
         contexts = self._parse_contexts(root, ns)
@@ -499,7 +504,7 @@ class EdinetFinancialAnalyzer:
 
         elements = root.findall(f".//ix:nonFraction[@name='{item_name}']", ns)
         if not elements:
-            for prefix in ("jpcrp_cor:", "jpigp_cor:"):
+            for prefix in ("jpcrp_cor:", "jpigp_cor:", "jppfs_cor:"):
                 elements = root.findall(
                     f".//ix:nonFraction[@name='{prefix}{item_name}']", ns
                 )
@@ -526,7 +531,7 @@ class EdinetFinancialAnalyzer:
 
         # 標準名前空間で検索
         for search_name in search_names:
-            for ns_prefix in ("jpcrp_cor", "jpigp_cor"):
+            for ns_prefix in ("jpcrp_cor", "jpigp_cor", "jppfs_cor"):
                 ns_uri = ns.get(ns_prefix)
                 if not ns_uri:
                     continue
@@ -536,7 +541,7 @@ class EdinetFinancialAnalyzer:
 
         # 企業固有名前空間で検索（タグ名末尾一致）
         for prefix, uri in namespaces.items():
-            if not prefix or prefix in ("jpcrp_cor", "jpigp_cor", "xbrli", "xlink", "link", "iso4217"):
+            if not prefix or prefix in ("jpcrp_cor", "jpigp_cor", "jppfs_cor", "xbrli", "xlink", "link", "iso4217"):
                 continue
             for search_name in search_names:
                 elements = root.findall(f".//{{{uri}}}{search_name}")

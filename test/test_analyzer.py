@@ -115,7 +115,8 @@ class TestProcessFinancialData:
     XBRL_SAMPLE = """<?xml version="1.0" encoding="UTF-8"?>
 <xbrli:xbrl
     xmlns:xbrli="http://www.xbrl.org/2003/instance"
-    xmlns:jpcrp_cor="http://disclosure.edinet-fsa.go.jp/taxonomy/jpcrp/2022-11-01/jpcrp_cor">
+    xmlns:jpcrp_cor="http://disclosure.edinet-fsa.go.jp/taxonomy/jpcrp/2022-11-01/jpcrp_cor"
+    xmlns:jppfs_cor="http://disclosure.edinet-fsa.go.jp/taxonomy/jppfs/2022-11-01/jppfs_cor">
   <xbrli:context id="CurrentYearDuration">
     <xbrli:period>
       <xbrli:startDate>2024-04-01</xbrli:startDate>
@@ -129,6 +130,8 @@ class TestProcessFinancialData:
   </xbrli:context>
   <jpcrp_cor:NetSales contextRef="CurrentYearDuration">1000000</jpcrp_cor:NetSales>
   <jpcrp_cor:Assets contextRef="CurrentYearInstant">2000000</jpcrp_cor:Assets>
+  <jppfs_cor:NetCashProvidedByUsedInOperatingActivities contextRef="CurrentYearDuration">500000</jppfs_cor:NetCashProvidedByUsedInOperatingActivities>
+  <jppfs_cor:PurchaseOfPropertyPlantAndEquipmentInvCF contextRef="CurrentYearDuration">-300000</jppfs_cor:PurchaseOfPropertyPlantAndEquipmentInvCF>
 </xbrli:xbrl>
 """
 
@@ -137,6 +140,16 @@ class TestProcessFinancialData:
         assert data is not None
         assert data["PL_NetSales_2024-04-01_2025-03-31"] == 1000000.0
         assert data["BS_Assets_2025-03-31"] == 2000000.0
+
+    def test_extracts_cf_details_from_jppfs_namespace(self, analyzer):
+        # CF明細(営業CF・設備投資)はjppfs_cor名前空間に属する。
+        # FCF = 営業CF - 設備投資 を計算できることを保証する回帰テスト。
+        data = analyzer.process_financial_data(self.XBRL_SAMPLE.encode("utf-8"))
+        opecf = data["CF_NetCashProvidedByUsedInOperatingActivities_2024-04-01_2025-03-31"]
+        capex = data["CF_PurchaseOfPropertyPlantAndEquipmentInvCF_2024-04-01_2025-03-31"]
+        assert opecf == 500000.0
+        assert capex == -300000.0
+        assert opecf + capex == 200000.0  # FCF
 
     def test_handles_bom(self, analyzer):
         data = analyzer.process_financial_data(
