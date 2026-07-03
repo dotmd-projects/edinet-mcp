@@ -49,6 +49,65 @@ class TestNormalizeCompanyName:
         assert norm(float("nan")) == ""
 
 
+class TestNormalizeEn:
+    def test_strips_corporate_suffixes(self):
+        ne = EdinetFinancialAnalyzer._normalize_en
+        assert ne("freee K.K.") == "freee"
+        assert ne("Sony Group Corporation") == "sonygroup"
+        assert ne("Toyota Motor Co., Ltd.") == "toyotamotor"
+
+    def test_keeps_non_suffix_co(self):
+        # "NAMCO" の末尾 "co" は法人格ではないので除去しない
+        assert EdinetFinancialAnalyzer._normalize_en("NAMCO") == "namco"
+
+    def test_non_string_returns_empty(self):
+        assert EdinetFinancialAnalyzer._normalize_en(None) == ""
+
+
+class TestHasJapanese:
+    def test_detects_kana_and_kanji(self):
+        hj = EdinetFinancialAnalyzer._has_japanese
+        assert hj("フリー") is True
+        assert hj("日本化薬") is True
+        assert hj("ﾃｽﾄ") is True  # 半角カナ
+        assert hj("freee") is False
+        assert hj("ABC123") is False
+
+
+class TestGetEdinetCode:
+    @pytest.fixture()
+    def analyzer_with_master(self, analyzer, monkeypatch, tmp_path):
+        # 提出者名・英字名・ヨミを持つ小さなマスタを用意する
+        csv = tmp_path / "EdinetcodeDlInfo.csv"
+        csv.write_text(
+            "ダウンロード情報行\n"
+            "ＥＤＩＮＥＴコード,提出者名,提出者名（英字）,提出者名（ヨミ）\n"
+            "E35325,フリー株式会社,freee K.K.,フリー\n"
+            "E00001,トヨタ自動車株式会社,Toyota Motor Corporation,トヨタジドウシャ\n"
+            "E00009,株式会社アクシーズ,Axyz Co.,アクシーズ\n",
+            encoding="cp932",
+        )
+        analyzer.master_dir = tmp_path
+        return analyzer
+
+    def test_english_name_search(self, analyzer_with_master):
+        # 英字・通称でヒットする（今回の改善の主目的）
+        assert analyzer_with_master.get_edinet_code("freee") == "E35325"
+
+    def test_english_name_with_japanese_suffix(self, analyzer_with_master):
+        assert analyzer_with_master.get_edinet_code("freee株式会社") == "E35325"
+
+    def test_japanese_name_still_works(self, analyzer_with_master):
+        assert analyzer_with_master.get_edinet_code("トヨタ自動車") == "E00001"
+
+    def test_katakana_exact_match(self, analyzer_with_master):
+        assert analyzer_with_master.get_edinet_code("フリー") == "E35325"
+
+    def test_japanese_dominant_input_does_not_false_match_english(self, analyzer_with_master):
+        # 末尾の "XYZ" が Axyz に誤マッチしないこと（日本語主体なので英字照合しない）
+        assert analyzer_with_master.get_edinet_code("存在しない企業XYZ") is None
+
+
 class TestSubmitDate:
     def test_extracts_date_part(self):
         doc = {"submitDateTime": "2025-06-25 15:00"}

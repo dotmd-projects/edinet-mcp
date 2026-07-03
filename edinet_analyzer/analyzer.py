@@ -176,6 +176,17 @@ class EdinetFinancialAnalyzer:
                 continue
             if "ＥＤＩＮＥＴコード" in df.columns and "提出者名" in df.columns:
                 df["_norm"] = df["提出者名"].apply(self._normalize_company_name)
+                # 英字名・ヨミでも検索できるよう正規化列を用意する
+                en_col = "提出者名（英字）"
+                kana_col = "提出者名（ヨミ）"
+                df["_norm_en"] = (
+                    df[en_col].apply(self._normalize_en)
+                    if en_col in df.columns else ""
+                )
+                df["_norm_kana"] = (
+                    df[kana_col].apply(self._normalize_company_name)
+                    if kana_col in df.columns else ""
+                )
                 self._master_df = df
                 return df
 
@@ -188,24 +199,50 @@ class EdinetFinancialAnalyzer:
         if df is None or df.empty:
             return None
 
-        normalized = self._normalize_company_name(company_name)
+        normalized = self._normalize_company_name(company_name)   # 日本語名・ヨミ用
+        # 英字照合は（法人格を除いた）入力に日本語が残らない場合のみ行う。
+        # 日本語主体の入力から末尾のわずかな英字を拾う誤マッチを防ぐ。2文字以上を要求。
+        # 例: "freee株式会社" → 法人格除去後 "freee"(日本語なし) → 英字照合を行う
+        #     "存在しない企業XYZ" → 日本語が残る → 英字照合しない
+        normalized_en = "" if self._has_japanese(normalized) else self._normalize_en(company_name)
+        if len(normalized_en) < 2:
+            normalized_en = ""
+        has_en = "_norm_en" in df.columns
+        has_kana = "_norm_kana" in df.columns
 
-        # 完全一致
+        # 完全一致（日本語名 → 英字名の順で優先）
         exact = df[df["_norm"] == normalized]
+        if exact.empty and has_en and normalized_en:
+            exact = df[df["_norm_en"] == normalized_en]
         if not exact.empty:
             match = exact.iloc[0]
             logger.info("企業を特定: %s (EDINETコード: %s)", match["提出者名"], match["ＥＤＩＮＥＴコード"])
             return match["ＥＤＩＮＥＴコード"]
 
-        # 部分一致 + 類似度
-        partial = df[df["_norm"].str.contains(normalized, na=False, regex=False)]
+        # 部分一致（日本語名・英字名・ヨミを横断）+ 類似度で最良を選ぶ
+        mask = df["_norm"].str.contains(normalized, na=False, regex=False)
+        if has_en and normalized_en:
+            mask = mask | df["_norm_en"].str.contains(normalized_en, na=False, regex=False)
+        if has_kana:
+            mask = mask | df["_norm_kana"].str.contains(normalized, na=False, regex=False)
+        partial = df[mask]
+
         if not partial.empty:
-            best_idx = max(
-                range(len(partial)),
-                key=lambda i: SequenceMatcher(
-                    None, normalized, partial.iloc[i]["_norm"]
-                ).ratio(),
-            )
+            def score(i: int) -> float:
+                row = partial.iloc[i]
+                # (照合クエリ, マスタ側の正規化文字列) の組で類似度を計算し最大を採用
+                pairs = [(normalized, row["_norm"])]
+                if has_en:
+                    pairs.append((normalized_en, row["_norm_en"]))
+                if has_kana:
+                    pairs.append((normalized, row["_norm_kana"]))
+                best = 0.0
+                for query, field in pairs:
+                    if query and isinstance(field, str) and field:
+                        best = max(best, SequenceMatcher(None, query, field).ratio())
+                return best
+
+            best_idx = max(range(len(partial)), key=score)
             match = partial.iloc[best_idx]
             logger.warning(
                 "完全一致なし。類似企業を使用: %s (EDINETコード: %s)",
@@ -224,6 +261,39 @@ class EdinetFinancialAnalyzer:
         for char in ("株式会社", "（株）", "(株)", "㈱", "　", " "):
             name = name.replace(char, "")
         return name.strip().lower()
+
+    # 英字社名の末尾に付く法人格・接尾辞（照合前に除去する）
+    _EN_SUFFIXES = (
+        "kabushikikaisha", "incorporated", "corporation", "holdings",
+        "company", "coltd", "limited", "corp", "inc", "ltd", "llc",
+        "plc", "kk",
+    )
+
+    @staticmethod
+    def _has_japanese(name) -> bool:
+        """ひらがな・カタカナ・漢字を含むか判定する"""
+        if not isinstance(name, str):
+            return False
+        return bool(re.search(r"[぀-ヿ㐀-鿿豈-﫿｡-ﾟ]", name))
+
+    @classmethod
+    def _normalize_en(cls, name) -> str:
+        """英字社名を照合用に正規化する（英数字のみ + 末尾の法人格を除去）
+
+        例: "freee K.K." → "freee", "Sony Group Corporation" → "sonygroup"
+        """
+        if not isinstance(name, str):
+            return ""
+        s = re.sub(r"[^a-z0-9]", "", name.lower())
+        # 末尾の法人格接尾辞を繰り返し除去（"Co., Ltd." のような複合に対応）
+        changed = True
+        while changed:
+            changed = False
+            for suf in cls._EN_SUFFIXES:
+                if len(s) > len(suf) and s.endswith(suf):
+                    s = s[: -len(suf)]
+                    changed = True
+        return s
 
     # ------------------------------------------------------------------
     # EDINET API
